@@ -1,12 +1,16 @@
-"""End-of-day quiz: send one Telegram quiz poll per word that appeared
-today, with wrong options drawn from the whole vocabulary."""
+"""Nightly quiz over your "problematic" words (the ones you flagged with 🤔).
+
+Picks a weighted sample (favoring words you get wrong most) without replacement,
+capped at MAX_QUIZ, and sends one native quiz poll per word. Each poll's id and
+correct option are recorded to pending_polls.json so the drain can score your
+answers later (poll_answer) and update per-word progress in words.json.
+"""
 import json
 import os
 import random
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -14,15 +18,78 @@ import requests
 # falls back to the local ./data dir for local runs.
 DATA_DIR = Path(os.environ.get("VOCAB_DATA_DIR") or Path(__file__).parent / "data")
 VOCAB_FILE = DATA_DIR / "vocab.json"
-DAILY_DIR = DATA_DIR / "daily"
-TZ = ZoneInfo("America/Vancouver")
+WORDS_FILE = DATA_DIR / "review" / "words.json"
+FORGOTTEN_FILE = DATA_DIR / "review" / "forgotten.json"
+PENDING_POLLS_FILE = DATA_DIR / "state" / "pending_polls.json"
 
 OPTION_LIMIT = 100  # Telegram poll option max length
 QUESTION_LIMIT = 300  # Telegram poll question max length
 NUM_OPTIONS = 4
+MAX_QUIZ = 8  # max words quizzed per night (your 5-10 range)
 
 
-def send_quiz(token: str, chat_id: str, es: str, correct: str, pool: list[str]) -> bool:
+def norm(s: str) -> str:
+    return (s or "").strip().casefold()
+
+
+def load_words() -> list[dict]:
+    if WORDS_FILE.exists():
+        return json.loads(WORDS_FILE.read_text(encoding="utf-8"))
+    return []
+
+
+def save_words(words: list[dict]) -> None:
+    WORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WORDS_FILE.write_text(
+        json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def seed_from_forgotten(words: list[dict]) -> bool:
+    """Add any 🤔-tapped words missing from words.json. Returns True if changed."""
+    if not FORGOTTEN_FILE.exists():
+        return False
+    forgotten = json.loads(FORGOTTEN_FILE.read_text(encoding="utf-8"))
+    have = {norm(w["es"]) for w in words}
+    changed = False
+    for e in forgotten:
+        if e.get("es") and e.get("en") and norm(e["es"]) not in have:
+            words.append(
+                {
+                    "es": e["es"],
+                    "en": e["en"],
+                    "correct": 0,
+                    "incorrect": 0,
+                    "retired": False,
+                    "added": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            have.add(norm(e["es"]))
+            changed = True
+    return changed
+
+
+def weighted_sample(words: list[dict], k: int) -> list[dict]:
+    """Sample up to k distinct words without replacement; weight favors words with
+    more incorrect and fewer correct answers: (incorrect + 1) / (correct + 1)."""
+    items = list(words)
+    weights = [(w.get("incorrect", 0) + 1) / (w.get("correct", 0) + 1) for w in items]
+    chosen = []
+    for _ in range(min(k, len(items))):
+        total = sum(weights)
+        r = random.uniform(0, total)
+        acc = 0.0
+        for i, w in enumerate(weights):
+            acc += w
+            if r <= acc:
+                chosen.append(items.pop(i))
+                weights.pop(i)
+                break
+    return chosen
+
+
+def send_quiz(token: str, chat_id: str, es: str, correct: str, pool: list[str]):
+    """Send one quiz poll. Returns (poll_id, correct_option_id) or None on failure."""
     distractors = [t for t in pool if t.casefold() != correct.casefold()]
     random.shuffle(distractors)
     # dedupe distractors case-insensitively, keep up to NUM_OPTIONS - 1
@@ -54,39 +121,55 @@ def send_quiz(token: str, chat_id: str, es: str, correct: str, pool: list[str]) 
     )
     if not resp.ok:
         print(f"Poll error for {es!r}: {resp.status_code} {resp.text}", file=sys.stderr)
-        return False
-    return True
+        return None
+    return resp.json()["result"]["poll"]["id"], correct_id
 
 
 def main() -> None:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-    date = datetime.now(TZ).date().isoformat()
-    path = DAILY_DIR / f"{date}.json"
-    if not path.exists():
-        print(f"No words logged for {date}; nothing to quiz.")
-        return
-    day = json.loads(path.read_text(encoding="utf-8"))
+    words = load_words()
+    if seed_from_forgotten(words):
+        save_words(words)
 
-    # distinct words sent today (preserve order)
-    todays = []
-    seen = set()
-    for e in day:
-        if e["es"].casefold() not in seen and e.get("en"):
-            seen.add(e["es"].casefold())
-            todays.append(e)
-    if not todays:
-        print(f"No quizzable words for {date}.")
+    active = [w for w in words if not w.get("retired") and w.get("en")]
+    if not active:
+        print("No active problematic words; nothing to quiz.")
         return
 
-    pool = [e["en"] for e in json.loads(VOCAB_FILE.read_text(encoding="utf-8")) if e.get("en")]
+    selected = weighted_sample(active, MAX_QUIZ)
+    pool = [
+        e["en"]
+        for e in json.loads(VOCAB_FILE.read_text(encoding="utf-8"))
+        if e.get("en")
+    ]
 
-    ok = True
-    for e in todays:
-        if not send_quiz(token, chat_id, e["es"], e["en"], pool):
+    pending = (
+        json.loads(PENDING_POLLS_FILE.read_text(encoding="utf-8"))
+        if PENDING_POLLS_FILE.exists()
+        else {}
+    )
+    sent, ok = 0, True
+    for w in selected:
+        result = send_quiz(token, chat_id, w["es"], w["en"], pool)
+        if result is None:
             ok = False
-    print(f"Sent {len(todays)} quiz poll(s) for {date}.")
+            continue
+        poll_id, correct_id = result
+        pending[poll_id] = {
+            "es": w["es"],
+            "en": w["en"],
+            "correct_option_id": correct_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        sent += 1
+
+    PENDING_POLLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_POLLS_FILE.write_text(
+        json.dumps(pending, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"Sent {sent} quiz poll(s) from {len(active)} active word(s).")
     if not ok:
         sys.exit(1)
 

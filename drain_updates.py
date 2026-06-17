@@ -12,7 +12,7 @@ sees a tap, the 🤔 button is replaced with an inert ✅ as a "recorded" marker
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -22,9 +22,13 @@ import requests
 DATA_DIR = Path(os.environ.get("VOCAB_DATA_DIR") or Path(__file__).parent / "data")
 DAILY_DIR = DATA_DIR / "daily"
 FORGOTTEN_FILE = DATA_DIR / "review" / "forgotten.json"
+WORDS_FILE = DATA_DIR / "review" / "words.json"
 OFFSET_FILE = DATA_DIR / "state" / "offset.json"
+PENDING_POLLS_FILE = DATA_DIR / "state" / "pending_polls.json"
 
 DONE_DATA = "noop"  # callback_data of the inert ✅ button after a word is recorded
+RETIRE_AT = 5  # correct quiz answers after which a word is considered learned
+PENDING_TTL_DAYS = 7  # drop unanswered quiz polls older than this
 
 
 def load_offset() -> int:
@@ -52,6 +56,47 @@ def save_forgotten(items: list[dict]) -> None:
     FORGOTTEN_FILE.write_text(
         json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def norm(s: str) -> str:
+    return (s or "").strip().casefold()
+
+
+def load_words() -> list[dict]:
+    if WORDS_FILE.exists():
+        return json.loads(WORDS_FILE.read_text(encoding="utf-8"))
+    return []
+
+
+def save_words(words: list[dict]) -> None:
+    WORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WORDS_FILE.write_text(
+        json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def load_pending() -> dict:
+    if PENDING_POLLS_FILE.exists():
+        return json.loads(PENDING_POLLS_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_pending(pending: dict) -> None:
+    PENDING_POLLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_POLLS_FILE.write_text(
+        json.dumps(pending, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def prune_pending(pending: dict) -> None:
+    """Drop quiz polls left unanswered longer than PENDING_TTL_DAYS (in place)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PENDING_TTL_DAYS)
+    for pid in [
+        pid
+        for pid, v in pending.items()
+        if datetime.fromisoformat(v["ts"]) < cutoff
+    ]:
+        del pending[pid]
 
 
 def parse_key(callback_data: str) -> tuple[str, int] | None:
@@ -116,7 +161,7 @@ def main() -> None:
         params={
             "offset": offset,
             "timeout": 0,
-            "allowed_updates": json.dumps(["callback_query"]),
+            "allowed_updates": json.dumps(["callback_query", "poll_answer"]),
         },
         timeout=60,
     )
@@ -131,49 +176,104 @@ def main() -> None:
 
     items = load_forgotten()
     seen = {(r["date"], r.get("idx")) for r in items}
-    logged = 0
+    words = load_words()
+    have = {norm(w["es"]) for w in words}
+    pending = load_pending()
+    logged = scored = 0
 
     for upd in updates:
         cq = upd.get("callback_query")
-        if not cq:
+        if cq:
+            logged += handle_tap(token, cq, items, seen, words, have)
             continue
-        key = parse_key(cq.get("data", ""))
-        if key is None:
-            # Inert ✅ (or unknown) button — acknowledge quietly, log nothing.
-            answer_callback(token, cq["id"], "")
-            continue
+        pa = upd.get("poll_answer")
+        if pa:
+            scored += handle_answer(pa, words, pending)
 
-        date, idx = key
-        entry = resolve_entry(date, idx)
-        if entry is None:
-            answer_callback(token, cq["id"], "Couldn't find that word \U0001f615")
-            continue
-
-        if key not in seen:  # dedupe: log each message at most once
-            items.append(
-                {
-                    "date": date,
-                    "idx": idx,
-                    "es": entry.get("es"),
-                    "en": entry.get("en"),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            seen.add(key)
-            logged += 1
-
-        # Lock the button to ✅ (retries on every tap until it succeeds), then ack.
-        msg = cq.get("message") or {}
-        chat_id = (msg.get("chat") or {}).get("id")
-        message_id = msg.get("message_id")
-        if chat_id and message_id:
-            disable_button(token, chat_id, message_id)
-        answer_callback(token, cq["id"], "Marked for review \U0001f44d")
-
+    prune_pending(pending)
     if logged:
         save_forgotten(items)
+    save_words(words)
+    save_pending(pending)
     save_offset(max(u["update_id"] for u in updates) + 1)
-    print(f"Processed {len(updates)} update(s); logged {logged} new forgotten word(s).")
+    print(
+        f"Processed {len(updates)} update(s); logged {logged} forgotten word(s), "
+        f"scored {scored} quiz answer(s)."
+    )
+
+
+def handle_tap(token, cq, items, seen, words, have) -> int:
+    """Process a 🤔 tap: log it (deduped), add to the word pool, lock button. Returns
+    1 if a new forgotten word was logged, else 0."""
+    key = parse_key(cq.get("data", ""))
+    if key is None:
+        # Inert ✅ (or unknown) button — acknowledge quietly, log nothing.
+        answer_callback(token, cq["id"], "")
+        return 0
+
+    date, idx = key
+    entry = resolve_entry(date, idx)
+    if entry is None:
+        answer_callback(token, cq["id"], "Couldn't find that word \U0001f615")
+        return 0
+
+    new = 0
+    if key not in seen:  # dedupe: log each message at most once
+        items.append(
+            {
+                "date": date,
+                "idx": idx,
+                "es": entry.get("es"),
+                "en": entry.get("en"),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        seen.add(key)
+        new = 1
+        # Add to the quiz pool the first time we see this word.
+        if entry.get("es") and norm(entry["es"]) not in have:
+            words.append(
+                {
+                    "es": entry["es"],
+                    "en": entry.get("en"),
+                    "correct": 0,
+                    "incorrect": 0,
+                    "retired": False,
+                    "added": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            have.add(norm(entry["es"]))
+
+    # Lock the button to ✅ (retries on every tap until it succeeds), then ack.
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+    if chat_id and message_id:
+        disable_button(token, chat_id, message_id)
+    answer_callback(token, cq["id"], "Marked for review \U0001f44d")
+    return new
+
+
+def handle_answer(pa: dict, words: list[dict], pending: dict) -> int:
+    """Score a quiz poll_answer against pending_polls and update the word's stats.
+    Returns 1 if an answer was scored, else 0."""
+    pid = pa.get("poll_id")
+    opts = pa.get("option_ids") or []
+    rec = pending.get(pid)
+    if not rec or not opts:  # unknown poll, or a retracted vote
+        return 0
+    correct = len(opts) == 1 and opts[0] == rec["correct_option_id"]
+    for w in words:
+        if norm(w["es"]) == norm(rec["es"]):
+            if correct:
+                w["correct"] = w.get("correct", 0) + 1
+                if w["correct"] >= RETIRE_AT:
+                    w["retired"] = True
+            else:
+                w["incorrect"] = w.get("incorrect", 0) + 1
+            break
+    del pending[pid]
+    return 1
 
 
 if __name__ == "__main__":
