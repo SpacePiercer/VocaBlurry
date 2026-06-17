@@ -1,0 +1,10 @@
+# This is the public code repo — data NEVER lives here. It is read/written in a
+# separate private repo, checked out into data-repo/ during CI.
+data/
+data-repo/
+
+# Raw Google Takeout export — personal activity data, never commit
+input/
+
+__pycache__/
+.venv/

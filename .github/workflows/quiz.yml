@@ -1,0 +1,27 @@
+name: Send vocab quiz
+
+on:
+  schedule:
+    # 9 PM Vancouver (04:00 UTC during PDT; 8 PM local in winter/PST).
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  quiz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: SpacePiercer/vocablurry-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data-repo
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python send_quiz.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VOCAB_DATA_DIR: data-repo/data
