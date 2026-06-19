@@ -2,8 +2,10 @@ name: Send vocab quiz
 
 on:
   schedule:
-    # 9 PM Vancouver (04:00 UTC during PDT; 8 PM local in winter/PST).
-    - cron: "0 4 * * *"
+    # ~9 PM Vancouver (04:07 UTC during PDT; 8 PM local in winter/PST).
+    # Offset off the top of the hour: GitHub's scheduler is most congested at
+    # :00 and drops/delays those runs.
+    - cron: "7 4 * * *"
   workflow_dispatch:
 
 # Shared with vocab.yml/drain.yml so pushes to the data repo never race.

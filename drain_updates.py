@@ -1,12 +1,18 @@
-"""Drain queued Telegram callback_query updates (taps on the 🤔 button) and log
-the corresponding words to data/review/forgotten.json.
+"""Drain queued Telegram updates and update per-word quiz scoring.
 
-Serverless by design: button taps queue inside Telegram and are read here via
+Handles two update types in chronological order:
+  - callback_query: taps on the 🤔 button -> log to data/review/forgotten.json,
+    add the word to the quiz pool (data/review/words.json), and reset its score
+    to 0 (scoring.record_dontknow).
+  - poll_answer: quiz answers -> look the poll up in pending_polls.json and move
+    the word's score ±1 (scoring.record_answer).
+
+Serverless by design: updates queue inside Telegram and are read here via
 getUpdates with a persisted offset, so no webhook/always-on listener is needed.
 This must be the only getUpdates consumer for the bot, or updates will race.
 
-Each word is logged at most once per message (deduped on date+index), so tapping
-the same button repeatedly never produces duplicates. On the first drain that
+Each word is logged/scored at most once per message (deduped on date+index), so
+tapping the same button repeatedly never double-counts. On the first drain that
 sees a tap, the 🤔 button is replaced with an inert ✅ as a "recorded" marker.
 """
 import json
@@ -16,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+import scoring
 
 # Data lives in a separate private repo in CI (checked out into VOCAB_DATA_DIR);
 # falls back to the local ./data dir for local runs.
@@ -27,7 +35,6 @@ OFFSET_FILE = DATA_DIR / "state" / "offset.json"
 PENDING_POLLS_FILE = DATA_DIR / "state" / "pending_polls.json"
 
 DONE_DATA = "noop"  # callback_data of the inert ✅ button after a word is recorded
-RETIRE_AT = 5  # correct quiz answers after which a word is considered learned
 PENDING_TTL_DAYS = 7  # drop unanswered quiz polls older than this
 
 
@@ -73,6 +80,23 @@ def save_words(words: list[dict]) -> None:
     WORDS_FILE.write_text(
         json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def index_words(words: list[dict]) -> dict[str, dict]:
+    """Normalize every pool word and return a {norm(es): record} lookup."""
+    return {norm(w["es"]): scoring.normalize(w) for w in words}
+
+
+def get_word(words: list[dict], by_es: dict[str, dict], es: str, en: str | None) -> dict:
+    """Find the pool word for `es`, creating (and normalizing) it if missing."""
+    rec = by_es.get(norm(es))
+    if rec is None:
+        rec = scoring.normalize({"es": es, "en": en})
+        words.append(rec)
+        by_es[norm(es)] = rec
+    elif en and not rec.get("en"):
+        rec["en"] = en
+    return rec
 
 
 def load_pending() -> dict:
@@ -177,18 +201,19 @@ def main() -> None:
     items = load_forgotten()
     seen = {(r["date"], r.get("idx")) for r in items}
     words = load_words()
-    have = {norm(w["es"]) for w in words}
+    by_es = index_words(words)  # also migrates legacy records in place
     pending = load_pending()
     logged = scored = 0
 
-    for upd in updates:
+    # Process in update_id order so the running score is deterministic.
+    for upd in sorted(updates, key=lambda u: u["update_id"]):
         cq = upd.get("callback_query")
         if cq:
-            logged += handle_tap(token, cq, items, seen, words, have)
+            logged += handle_tap(token, cq, items, seen, words, by_es)
             continue
         pa = upd.get("poll_answer")
         if pa:
-            scored += handle_answer(pa, words, pending)
+            scored += handle_answer(pa, by_es, pending)
 
     prune_pending(pending)
     if logged:
@@ -202,9 +227,9 @@ def main() -> None:
     )
 
 
-def handle_tap(token, cq, items, seen, words, have) -> int:
-    """Process a 🤔 tap: log it (deduped), add to the word pool, lock button. Returns
-    1 if a new forgotten word was logged, else 0."""
+def handle_tap(token, cq, items, seen, words, by_es) -> int:
+    """Process a 🤔 tap: log it (deduped), add/reset the pool word, lock button.
+    Returns 1 if a new forgotten word was logged, else 0."""
     key = parse_key(cq.get("data", ""))
     if key is None:
         # Inert ✅ (or unknown) button — acknowledge quietly, log nothing.
@@ -218,7 +243,7 @@ def handle_tap(token, cq, items, seen, words, have) -> int:
         return 0
 
     new = 0
-    if key not in seen:  # dedupe: log each message at most once
+    if key not in seen and entry.get("es"):  # dedupe: count each message once
         items.append(
             {
                 "date": date,
@@ -230,19 +255,9 @@ def handle_tap(token, cq, items, seen, words, have) -> int:
         )
         seen.add(key)
         new = 1
-        # Add to the quiz pool the first time we see this word.
-        if entry.get("es") and norm(entry["es"]) not in have:
-            words.append(
-                {
-                    "es": entry["es"],
-                    "en": entry.get("en"),
-                    "correct": 0,
-                    "incorrect": 0,
-                    "retired": False,
-                    "added": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            have.add(norm(entry["es"]))
+        # Add to / reset in the quiz pool: a 🤔 tap means "I don't know this".
+        rec = get_word(words, by_es, entry["es"], entry.get("en"))
+        scoring.record_dontknow(rec)
 
     # Lock the button to ✅ (retries on every tap until it succeeds), then ack.
     msg = cq.get("message") or {}
@@ -254,7 +269,7 @@ def handle_tap(token, cq, items, seen, words, have) -> int:
     return new
 
 
-def handle_answer(pa: dict, words: list[dict], pending: dict) -> int:
+def handle_answer(pa: dict, by_es: dict[str, dict], pending: dict) -> int:
     """Score a quiz poll_answer against pending_polls and update the word's stats.
     Returns 1 if an answer was scored, else 0."""
     pid = pa.get("poll_id")
@@ -263,15 +278,9 @@ def handle_answer(pa: dict, words: list[dict], pending: dict) -> int:
     if not rec or not opts:  # unknown poll, or a retracted vote
         return 0
     correct = len(opts) == 1 and opts[0] == rec["correct_option_id"]
-    for w in words:
-        if norm(w["es"]) == norm(rec["es"]):
-            if correct:
-                w["correct"] = w.get("correct", 0) + 1
-                if w["correct"] >= RETIRE_AT:
-                    w["retired"] = True
-            else:
-                w["incorrect"] = w.get("incorrect", 0) + 1
-            break
+    word = by_es.get(norm(rec["es"]))
+    if word is not None:
+        scoring.record_answer(word, correct)
     del pending[pid]
     return 1
 

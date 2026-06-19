@@ -1,0 +1,26 @@
+name: Health check
+
+on:
+  schedule:
+    # Once a day at 05:13 UTC (~10 PM Vancouver, PDT). Off the top of the hour
+    # since GitHub's scheduler drops/delays :00 runs.
+    - cron: "13 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: SpacePiercer/vocablurry-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data-repo
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python health_check.py
+        env:
+          VOCAB_DATA_DIR: data-repo/data

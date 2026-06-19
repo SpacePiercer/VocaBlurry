@@ -11,12 +11,44 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import scoring
+
 # Data lives in a separate private repo in CI (checked out into VOCAB_DATA_DIR);
 # falls back to the local ./data dir for local runs.
 DATA_DIR = Path(os.environ.get("VOCAB_DATA_DIR") or Path(__file__).parent / "data")
 VOCAB_FILE = DATA_DIR / "vocab.json"
 DAILY_DIR = DATA_DIR / "daily"
+WORDS_FILE = DATA_DIR / "review" / "words.json"
 TZ = ZoneInfo("America/Vancouver")
+
+
+def is_single_word(es: str) -> bool:
+    """Reject multi-word phrases — only feed single Spanish words."""
+    return len(es.split()) == 1
+
+
+def learned_set() -> set[str]:
+    """Normalized es of words already learned (score 5), to skip in the feed."""
+    if not WORDS_FILE.exists():
+        return set()
+    words = json.loads(WORDS_FILE.read_text(encoding="utf-8"))
+    return {
+        w["es"].strip().casefold()
+        for w in words
+        if scoring.normalize(w)["learned"]
+    }
+
+
+def choose_entry(vocab: list[dict]) -> dict:
+    """Pick a random single-word, not-yet-learned entry (falling back gracefully)."""
+    learned = learned_set()
+    eligible = [
+        e for e in vocab
+        if is_single_word(e["es"]) and e["es"].strip().casefold() not in learned
+    ]
+    if not eligible:  # everything single-word is learned — allow re-review
+        eligible = [e for e in vocab if is_single_word(e["es"])] or vocab
+    return random.choice(eligible)
 
 
 def log_daily(entry: dict) -> tuple[str, int]:
@@ -41,7 +73,7 @@ def main() -> None:
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     vocab = json.loads(VOCAB_FILE.read_text(encoding="utf-8"))
-    entry = random.choice(vocab)
+    entry = choose_entry(vocab)
     es, en = entry["es"], entry["en"]
 
     # Log first so we know this entry's (date, index) for the button callback_data.
