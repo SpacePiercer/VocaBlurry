@@ -14,6 +14,8 @@ from pathlib import Path
 
 import requests
 
+import scoring
+
 # Data lives in a separate private repo in CI (checked out into VOCAB_DATA_DIR);
 # falls back to the local ./data dir for local runs.
 DATA_DIR = Path(os.environ.get("VOCAB_DATA_DIR") or Path(__file__).parent / "data")
@@ -54,16 +56,7 @@ def seed_from_forgotten(words: list[dict]) -> bool:
     changed = False
     for e in forgotten:
         if e.get("es") and e.get("en") and norm(e["es"]) not in have:
-            words.append(
-                {
-                    "es": e["es"],
-                    "en": e["en"],
-                    "correct": 0,
-                    "incorrect": 0,
-                    "retired": False,
-                    "added": datetime.now(timezone.utc).isoformat(),
-                }
-            )
+            words.append(scoring.normalize({"es": e["es"], "en": e["en"]}))
             have.add(norm(e["es"]))
             changed = True
     return changed
@@ -130,12 +123,14 @@ def main() -> None:
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     words = load_words()
-    if seed_from_forgotten(words):
-        save_words(words)
+    seed_from_forgotten(words)
+    for w in words:  # migrate legacy records + ensure scoring fields
+        scoring.normalize(w)
 
-    active = [w for w in words if not w.get("retired") and w.get("en")]
+    active = [w for w in words if not w["learned"] and w.get("en")]
     if not active:
-        print("No active problematic words; nothing to quiz.")
+        print("No words in review; nothing to quiz.")
+        save_words(words)  # persist any migration
         return
 
     selected = weighted_sample(active, MAX_QUIZ)
@@ -163,13 +158,15 @@ def main() -> None:
             "correct_option_id": correct_id,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        scoring.record_quiz_sent(w)  # count this appearance in a quiz
         sent += 1
 
+    save_words(words)
     PENDING_POLLS_FILE.parent.mkdir(parents=True, exist_ok=True)
     PENDING_POLLS_FILE.write_text(
         json.dumps(pending, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"Sent {sent} quiz poll(s) from {len(active)} active word(s).")
+    print(f"Sent {sent} quiz poll(s) from {len(active)} word(s) in review.")
     if not ok:
         sys.exit(1)
 

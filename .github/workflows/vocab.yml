@@ -2,9 +2,10 @@ name: Send vocab word
 
 on:
   schedule:
-    # Every 2h during Vancouver daytime: 9am-7pm PDT (16:00-02:00 UTC).
+    # Every 2h during Vancouver daytime: ~9am-7pm PDT (16:00-02:00 UTC).
     # Cron is UTC, so in winter (PST) this shifts to 8am-6pm local.
-    - cron: "0 16,18,20,22,0,2 * * *"
+    # Offset to :17 — GitHub drops/delays runs scheduled at the top of the hour.
+    - cron: "17 16,18,20,22,0,2 * * *"
   workflow_dispatch:
 
 # Data lives in the private repo; pushes there are serialized with drain.yml.
