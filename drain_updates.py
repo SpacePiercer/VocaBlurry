@@ -65,10 +65,6 @@ def save_forgotten(items: list[dict]) -> None:
     )
 
 
-def norm(s: str) -> str:
-    return (s or "").strip().casefold()
-
-
 def load_words() -> list[dict]:
     if WORDS_FILE.exists():
         return json.loads(WORDS_FILE.read_text(encoding="utf-8"))
@@ -84,16 +80,16 @@ def save_words(words: list[dict]) -> None:
 
 def index_words(words: list[dict]) -> dict[str, dict]:
     """Normalize every pool word and return a {norm(es): record} lookup."""
-    return {norm(w["es"]): scoring.normalize(w) for w in words}
+    return {scoring.norm(w["es"]): scoring.normalize(w) for w in words}
 
 
 def get_word(words: list[dict], by_es: dict[str, dict], es: str, en: str | None) -> dict:
     """Find the pool word for `es`, creating (and normalizing) it if missing."""
-    rec = by_es.get(norm(es))
+    rec = by_es.get(scoring.norm(es))
     if rec is None:
         rec = scoring.normalize({"es": es, "en": en})
         words.append(rec)
-        by_es[norm(es)] = rec
+        by_es[scoring.norm(es)] = rec
     elif en and not rec.get("en"):
         rec["en"] = en
     return rec
@@ -154,9 +150,7 @@ def disable_button(token: str, chat_id: int, message_id: int) -> None:
             json={
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "reply_markup": json.dumps(
-                    {"inline_keyboard": [[{"text": "✅", "callback_data": DONE_DATA}]]}
-                ),
+                "reply_markup": {"inline_keyboard": [[{"text": "✅", "callback_data": DONE_DATA}]]},
             },
             timeout=30,
         )
@@ -199,7 +193,7 @@ def main() -> None:
         return
 
     items = load_forgotten()
-    seen = {(r["date"], r.get("idx")) for r in items}
+    seen = {(r["date"], r["idx"]) for r in items if r.get("idx") is not None}
     words = load_words()
     by_es = index_words(words)  # also migrates legacy records in place
     pending = load_pending()
@@ -278,7 +272,7 @@ def handle_answer(pa: dict, by_es: dict[str, dict], pending: dict) -> int:
     if not rec or not opts:  # unknown poll, or a retracted vote
         return 0
     correct = len(opts) == 1 and opts[0] == rec["correct_option_id"]
-    word = by_es.get(norm(rec["es"]))
+    word = by_es.get(scoring.norm(rec["es"]))
     if word is not None:
         scoring.record_answer(word, correct)
     del pending[pid]

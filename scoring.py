@@ -21,6 +21,11 @@ SCORE_MAX = 5
 _NUMERIC = ("score", "correct", "incorrect", "dontknow_clicks", "quizzes")
 
 
+def norm(s: str) -> str:
+    """Canonical key for Spanish words: strip whitespace, casefold."""
+    return (s or "").strip().casefold()
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
