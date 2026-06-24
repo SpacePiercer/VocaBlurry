@@ -30,10 +30,6 @@ NUM_OPTIONS = 4
 MAX_QUIZ = 8  # max words quizzed per night (your 5-10 range)
 
 
-def norm(s: str) -> str:
-    return (s or "").strip().casefold()
-
-
 def load_words() -> list[dict]:
     if WORDS_FILE.exists():
         return json.loads(WORDS_FILE.read_text(encoding="utf-8"))
@@ -52,12 +48,12 @@ def seed_from_forgotten(words: list[dict]) -> bool:
     if not FORGOTTEN_FILE.exists():
         return False
     forgotten = json.loads(FORGOTTEN_FILE.read_text(encoding="utf-8"))
-    have = {norm(w["es"]) for w in words}
+    have = {scoring.norm(w["es"]) for w in words}
     changed = False
     for e in forgotten:
-        if e.get("es") and e.get("en") and norm(e["es"]) not in have:
+        if e.get("es") and e.get("en") and scoring.norm(e["es"]) not in have:
             words.append(scoring.normalize({"es": e["es"], "en": e["en"]}))
-            have.add(norm(e["es"]))
+            have.add(scoring.norm(e["es"]))
             changed = True
     return changed
 
@@ -105,7 +101,7 @@ def send_quiz(token: str, chat_id: str, es: str, correct: str, pool: list[str]):
         json={
             "chat_id": chat_id,
             "question": question,
-            "options": json.dumps(options, ensure_ascii=False),
+            "options": options,
             "type": "quiz",
             "correct_option_id": correct_id,
             "is_anonymous": False,
@@ -123,12 +119,14 @@ def main() -> None:
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     words = load_words()
-    seed_from_forgotten(words)
+    added = seed_from_forgotten(words)
     for w in words:  # migrate legacy records + ensure scoring fields
         scoring.normalize(w)
 
     active = [w for w in words if not w["learned"] and w.get("en")]
     if not active:
+        if added:
+            print(f"Seeded {sum(1 for w in words if not w.get('quizzes'))} new word(s) from forgotten log.")
         print("No words in review; nothing to quiz.")
         save_words(words)  # persist any migration
         return

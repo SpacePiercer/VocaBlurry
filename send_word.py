@@ -96,7 +96,7 @@ def main() -> None:
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "reply_markup": json.dumps(reply_markup),
+            "reply_markup": reply_markup,
         },
         timeout=30,
     )
