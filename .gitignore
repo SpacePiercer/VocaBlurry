@@ -8,3 +8,24 @@ input/
 
 __pycache__/
 .venv/
+
+# --- standard (added 2026-09-30) ---
+*.py[cod]
+venv/
+env/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ipynb_checkpoints/
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+# --- local agent / planning docs, never published ---
+CLAUDE.md
+AGENTS.md
+MANIFEST.md
+.claude/
