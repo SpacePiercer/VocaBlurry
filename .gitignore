@@ -29,3 +29,7 @@ CLAUDE.md
 AGENTS.md
 MANIFEST.md
 .claude/
+
+# session progress logs and roadmap, kept local
+progress/
+docs/ROADMAP.md
