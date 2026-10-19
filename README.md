@@ -60,6 +60,9 @@ changes back there. Scripts default to `./data` when `VOCAB_DATA_DIR` is unset
   `data/state/pending_polls.json` for the drain to score (`MAX_QUIZ` is a tunable
   constant at the top of the file).
 - `health_check.py` — renders the per-word scores table to the Actions step summary.
+- `publish_stats.py` — after the nightly quiz, writes aggregates-only `stats.json`
+  (date, learned count, in-review count, average score) to this public repo for the
+  portfolio site's live widget. No words or times are published.
 - `set_bot_meta.py` — one-off: sets the bot's profile description (explains 🤔).
 - `.github/workflows/` — `vocab.yml` (sends 6×/day), `drain.yml` (drains 2×/day),
   `quiz.yml` (daily quiz), `health.yml` (daily/on-demand scores table).
