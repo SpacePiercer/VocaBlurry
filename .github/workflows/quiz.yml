@@ -16,6 +16,8 @@ concurrency:
 jobs:
   quiz:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # publish stats.json to this repo
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -45,3 +47,20 @@ jobs:
             git pull --rebase
             git push
           fi
+      # Aggregates-only stats (counts + date) for the portfolio site's live widget.
+      - name: Publish public stats.json
+        if: always()
+        run: |
+          python publish_stats.py
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add stats.json
+          if git diff --staged --quiet; then
+            echo "Stats unchanged."
+          else
+            git commit -m "Update public stats [skip ci]"
+            git pull --rebase
+            git push
+          fi
+        env:
+          VOCAB_DATA_DIR: data-repo/data
